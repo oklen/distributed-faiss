@@ -40,6 +40,7 @@ class IndexCfg:
         self.index_storage_dir = index_storage_dir
         self.custom_meta_id_idx = custom_meta_id_idx
         self.extra = kwargs
+        self.rank = 0
 
     def get_metric(self):
         metric = self.metric

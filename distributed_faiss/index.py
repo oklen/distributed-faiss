@@ -11,6 +11,7 @@ import os
 import pickle
 import threading
 import time
+import copy
 from typing import Tuple, Optional, List, Union
 
 import faiss
@@ -37,6 +38,11 @@ def init_faiss_ivf_simple(cfg: IndexCfg):
     metric = cfg.get_metric()
     index = faiss.IndexIVFFlat(get_quantizer(cfg), cfg.dim, cfg.centroids, metric)
     index.nprobe = cfg.nprobe
+
+    # index = get_quantizer(cfg)
+    res = faiss.StandardGpuResources()
+    index = faiss.index_cpu_to_gpu(res, cfg.rank, index)
+    # index = faiss.index_cpu_to_all_gpus(index)
     return index
 
 
@@ -55,16 +61,27 @@ def init_faiss_hnswsq(cfg: IndexCfg):
         faiss.ScalarQuantizer.QT_8bit,
         cfg.extra.get("store_n", 128),
     )
+    
     index.hnsw.efSearch = cfg.nprobe
     index.hnsw.efConstruction = cfg.extra.get("ef_construction", 100)
-    return index
 
+    res = faiss.StandardGpuResources()
+    index = faiss.index_cpu_to_gpu(res, cfg.rank, index)
+
+    return index
 
 def init_faiss_ivf_scalar_qr(cfg: IndexCfg):
     index = faiss.IndexIVFScalarQuantizer(
         get_quantizer(cfg), cfg.dim, cfg.centroids, faiss.ScalarQuantizer.QT_fp16
     )
     index.nprobe = cfg.nprobe
+
+    res = faiss.StandardGpuResources()
+    res.setTempMemory(5 * (2**30))
+    res.setPinnedMemory(2**30)
+    
+    index = faiss.index_cpu_to_gpu(res, cfg.rank, index)
+    
     return index
 
 
@@ -78,6 +95,8 @@ def init_faiss_ivf_gpu(cfg: IndexCfg):
         quantizer = faiss.IndexFlatL2(cfg.dim)
     else:
         raise RuntimeError(f"Metric={metric} is not supported for ivf_gpu factory")
+
+    index = faiss.IndexIVFFlat(get_quantizer(cfg), cfg.dim, cfg.centroids, metric)
 
     index_ivf = faiss.extract_index_ivf(index)
     clustering_index = faiss.index_cpu_to_all_gpus(quantizer)
@@ -109,7 +128,7 @@ def get_index_files(index_storage_dir: str) -> Tuple[str, str, str, str]:
 
 
 class Index:
-    def __init__(self, cfg: IndexCfg):
+    def __init__(self, cfg: IndexCfg, rank: int):
         self.cfg = cfg
         self.embeddings_buffer = []
         self.total_data = 0
@@ -118,6 +137,8 @@ class Index:
         self.index_lock = threading.Lock()
         self.state = IndexState.NOT_TRAINED
         self.faiss_index = None
+        self.flat_faiss_index = None # vector maps
+        self.rank = rank
 
         self.index_save_time = time.time()
         self.index_saved_size = 0
@@ -212,14 +233,21 @@ class Index:
         total_data_size = all_data_as_np_array.shape[0]
         index = self._init_faiss_index(total_data_size)
 
+        # Create Flat map
+        flat_index = faiss_special_index_factories['flat'](cfg)
+
+
         logging.info(f"Created a faiss index of type {type(index)}")
         logger.info(f"Training index with array shaped {train_data.shape}")
         index.train(train_data)
+        flat_index.train(train_data)
         logger.info(f"Index trained")
 
         with self.index_lock:
             self.faiss_index = index
+            self.flat_faiss_index = flat_index
             self.state = IndexState.TRAINED
+
         self.add_buffer_to_index()
 
     def add_buffer_to_index(self) -> None:
@@ -252,7 +280,11 @@ class Index:
             # TODO: avoid locking for single query calls (or small batches?)
 
             if return_embeddings:
-                scores, indexes, embs = self.faiss_index.search_and_reconstruct(query_batch, top_k)
+                # scores, indexes, embs = self.faiss_index.search_and_reconstruct(query_batch, top_k)
+                scores, indexes = self.faiss_index.search(query_batch, top_k)
+                embs = list(map(lambda x: list(map(lambda q:self.flat_faiss_index.reconstruct(int(q)), x)), indexes))
+                embs = np.array(embs)
+                # embds = self.flat_faiss_index.reconstruct(indexes)
             else:
                 scores, indexes = self.faiss_index.search(query_batch, top_k)
                 embs = None
@@ -379,6 +411,7 @@ class Index:
 
     def _init_faiss_index(self, total_data_size: int):
         cfg = self.cfg
+        cfg.rank = self.rank
         logger.info(f"Data size for indexing {total_data_size}")
         if cfg.index_builder_type:
             index = faiss_special_index_factories[cfg.index_builder_type](cfg)
@@ -423,6 +456,7 @@ class Index:
                 logger.info(f"Adding {add_data_as_np.shape[0]} to the trained index.")
                 start_time = time.time()
                 self.faiss_index.add(add_data_as_np)
+                self.flat_faiss_index.add(add_data_as_np)
                 logger.info(
                     f"Add completed in {time.time() - start_time}. ntotal={self.faiss_index.ntotal}"
                 )
@@ -457,10 +491,13 @@ class Index:
             if os.path.exists(index_file):
                 logger.info("Index file already exists. overwriting save")
 
-            faiss.write_index(self.faiss_index, index_file)
-            with open(meta_file, mode="wb") as f:
-                pickle.dump(self.id_to_metadata, f)
-            logger.info(f"Saved index & meta to: {index_file} | {meta_file}")
+            try:
+                faiss.write_index(self.faiss_index, index_file)
+                with open(meta_file, mode="wb") as f:
+                    pickle.dump(self.id_to_metadata, f)
+                logger.info(f"Saved index & meta to: {index_file} | {meta_file}")
+            except:
+                logger.info("Index dump Failed")
 
             with open(buffer_file, mode="wb") as f:
                 pickle.dump(self.embeddings_buffer, f)

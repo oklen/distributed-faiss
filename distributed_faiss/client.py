@@ -60,7 +60,7 @@ class IndexClient:
     subset of the inverted lists. Searches are merged afterwards
     """
 
-    def __init__(self, server_list_path: str, cfg_path: Optional[str] = None):
+    def __init__(self, server_list_path: str, cfg_path: Optional[str] = None, cfg = None):
         """connect to a series of (host, port) pairs"""
         machine_ports = IndexClient.read_server_list(server_list_path)
         self.sub_indexes = IndexClient.setup_connection(machine_ports)
@@ -82,7 +82,10 @@ class IndexClient:
         self.cur_server_ids = {}
 
         random.seed(time.time())
-        self.cfg = IndexCfg.from_json(cfg_path) if cfg_path is not None else None
+        if cfg is not None:
+            self.cfg = cfg
+        else:
+            self.cfg = IndexCfg.from_json(cfg_path) if cfg_path is not None else None
 
     @staticmethod
     def read_server_list(

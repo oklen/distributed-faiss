@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import _thread
+import threading
 import argparse
 import logging
 import os
@@ -36,11 +37,13 @@ logger.addHandler(console)
 
 
 class IndexServer:
-    def __init__(self, rank: int, index_storage_dir):
+    def __init__(self,  rank, index_storage_dir, local_rank):
         self.indexes = {}
         self.indexes_lock = threading.Lock()
         self.rank = rank
+        self.local_rank = local_rank
         self.socket = None
+        self.lock = threading.RLock()
         logger.info(f"IndexServer saving to {index_storage_dir} , rank={rank}")
         self.index_storage_dir = index_storage_dir
 
@@ -245,7 +248,7 @@ class IndexServer:
 
         with self.indexes_lock:
             if index_id not in self.indexes:
-                self.indexes[index_id] = Index(cfg)
+                self.indexes[index_id] = Index(cfg, self.rank)
                 logger.info(f"Created new index {index_id}")
                 logger.info(f"CFG: {str(cfg)}")
                 return True
